@@ -667,6 +667,11 @@ public class SpeechTokenizerDecoder: Module {
             // Trim left context samples
             let trimSamples = actualContext * samplesPerFrame
             let totalSamples = chunkWaveform.dim(1)
+            guard trimSamples < totalSamples else {
+                // Decoder produced fewer samples than the context overlap — skip empty chunk
+                offset = chunkEnd
+                continue
+            }
             let kept = chunkWaveform[0..., trimSamples..<totalSamples, 0...]
 
             audioChunks.append(kept)
