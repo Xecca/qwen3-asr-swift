@@ -194,6 +194,24 @@ CLI:
 .build/release/qwen3-tts-cli "Hello world" --stream --first-chunk-frames 1
 ```
 
+### Cancellation
+
+Generation is synchronous and can run for tens of seconds. Pass an `isCancelled` closure — it is polled once per
+talker step (~65 ms), and generation stops at the next step when it returns `true`. `synthesize()` returns `[]`
+in that case (the codec decode is skipped); `synthesizeStream()` simply finishes early. A stream also stops
+generating on its own when the consumer stops iterating or its task is cancelled.
+
+```swift
+let cancelled = ManagedAtomic(false)   // any thread-safe flag works
+
+let task = Task.detached {
+    model.synthesize(text: longText, language: "english", isCancelled: { cancelled.load(ordering: .relaxed) })
+}
+
+// Later, from the UI:
+cancelled.store(true, ordering: .relaxed)
+```
+
 ## CosyVoice TTS Usage
 
 ### Basic Synthesis

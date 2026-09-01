@@ -20,6 +20,21 @@ public enum TTSError: Error, LocalizedError {
 }
 
 /// A chunk of audio produced during streaming synthesis.
+/// Thread-safe one-shot flag used to stop streaming generation when the consumer terminates.
+final class StreamTerminationFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+
+    var isSet: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return value
+    }
+
+    func set() {
+        lock.lock(); value = true; lock.unlock()
+    }
+}
+
 public struct TTSAudioChunk: Sendable {
     /// PCM audio samples at 24 kHz, Float32
     public let samples: [Float]
@@ -90,13 +105,16 @@ public class Qwen3TTSModel {
     ///   - speaker: Speaker voice name (requires CustomVoice model, e.g., "vivian", "ryan")
     ///   - instruct: Instruction text for style control (requires CustomVoice model, e.g., "Speak cheerfully")
     ///   - sampling: Sampling configuration
-    /// - Returns: Audio samples at 24kHz
+    ///   - isCancelled: Polled once per generation step; return `true` to abort. When cancelled,
+    ///     generation stops at the next step and an empty array is returned (codec decode is skipped).
+    /// - Returns: Audio samples at 24kHz, or `[]` if cancelled
     public func synthesize(
         text: String,
         language: String = "english",
         speaker: String? = nil,
         instruct: String? = nil,
-        sampling: SamplingConfig = .default
+        sampling: SamplingConfig = .default,
+        isCancelled: (() -> Bool)? = nil
     ) -> [Float] {
         guard let tokenizer = tokenizer else {
             fatalError("Tokenizer not loaded. Call setTokenizer() first.")
@@ -110,7 +128,8 @@ public class Qwen3TTSModel {
 
         guard let langId = CodecTokens.languageId(for: effectiveLanguage) else {
             print("Warning: Unknown language '\(effectiveLanguage)', defaulting to English")
-            return synthesize(text: text, language: "english", speaker: speaker, sampling: sampling)
+            return synthesize(text: text, language: "english", speaker: speaker, instruct: instruct,
+                              sampling: sampling, isCancelled: isCancelled)
         }
 
         let t0 = CFAbsoluteTimeGetCurrent()
@@ -132,7 +151,13 @@ public class Qwen3TTSModel {
             prefillEmbeds: prefillEmbeds,
             trailingTextHidden: trailingTextHidden,
             ttsPadEmbed: ttsPadEmbed,
-            sampling: sampling)
+            sampling: sampling,
+            isCancelled: isCancelled)
+
+        if isCancelled?() == true {
+            print("  Synthesis cancelled after \(numFrames) codec tokens, skipping decode")
+            return []
+        }
 
         eval(allCodebooks)
         let t2 = CFAbsoluteTimeGetCurrent()
@@ -174,6 +199,8 @@ public class Qwen3TTSModel {
     ///   - instruct: Instruction text for style control (requires CustomVoice model)
     ///   - sampling: Sampling configuration
     ///   - streaming: Streaming configuration (chunk sizes, decoder context)
+    ///   - isCancelled: Polled once per generation step; return `true` to abort early.
+    ///     The stream also stops generating when the consumer cancels or drops it.
     /// - Returns: An async stream of `TTSAudioChunk` values
     public func synthesizeStream(
         text: String,
@@ -181,9 +208,15 @@ public class Qwen3TTSModel {
         speaker: String? = nil,
         instruct: String? = nil,
         sampling: SamplingConfig = .default,
-        streaming: StreamingConfig = .default
+        streaming: StreamingConfig = .default,
+        isCancelled: (() -> Bool)? = nil
     ) -> AsyncThrowingStream<TTSAudioChunk, Error> {
         AsyncThrowingStream { continuation in
+            // Consumer went away (cancelled / stopped iterating) → stop the generation loop
+            let terminated = StreamTerminationFlag()
+            continuation.onTermination = { _ in terminated.set() }
+            let shouldStop: () -> Bool = { terminated.isSet || isCancelled?() == true }
+
             Task {
                 do {
                     try self.runStreamingGeneration(
@@ -193,6 +226,7 @@ public class Qwen3TTSModel {
                         instruct: instruct,
                         sampling: sampling,
                         streaming: streaming,
+                        isCancelled: shouldStop,
                         continuation: continuation)
                     continuation.finish()
                 } catch {
@@ -211,6 +245,7 @@ public class Qwen3TTSModel {
         instruct: String?,
         sampling: SamplingConfig,
         streaming: StreamingConfig,
+        isCancelled: () -> Bool,
         continuation: AsyncThrowingStream<TTSAudioChunk, Error>.Continuation
     ) throws {
         guard let tokenizer = tokenizer else {
@@ -309,6 +344,11 @@ public class Qwen3TTSModel {
 
         // Autoregressive generation loop
         for iterIdx in 1..<safeMaxTokens {
+            if isCancelled() {
+                print("  Talker: cancelled after \(generatedFirstCodebook.count) tokens")
+                return
+            }
+
             // Text side
             let textEmbed: MLXArray
             let trailingLen = trailingTextHidden.dim(1)
@@ -1245,7 +1285,8 @@ public class Qwen3TTSModel {
         prefillEmbeds: MLXArray,
         trailingTextHidden: MLXArray,
         ttsPadEmbed: MLXArray,
-        sampling: SamplingConfig
+        sampling: SamplingConfig,
+        isCancelled: (() -> Bool)? = nil
     ) -> (allCodebooks: MLXArray, numFrames: Int) {
         let safeMaxTokens = min(sampling.maxTokens, 500)
 
@@ -1298,6 +1339,11 @@ public class Qwen3TTSModel {
 
         // Autoregressive generation
         for iterIdx in 1..<safeMaxTokens {
+            if isCancelled?() == true {
+                print("  Talker: cancelled after \(generatedFirstCodebook.count) tokens")
+                break
+            }
+
             // Text side: next trailing text embed or tts_pad
             let textEmbed: MLXArray
             let trailingLen = trailingTextHidden.dim(1)
